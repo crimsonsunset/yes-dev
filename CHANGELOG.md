@@ -3,6 +3,51 @@
 Newest first. Each entry says what changed and, where it matters, what was
 measured - the numbers are from this repo's own runs, not estimates.
 
+## 1.2.1
+
+macOS on Chrome 153. The engine found the sheet, logged an approval, and Chrome
+granted nothing. Two separate bugs, both invisible from the log as it was.
+
+### macOS: the sheet is there, the title is not
+
+Chrome 152 put "Allow remote debugging?" on the `AXSheet` itself. Chrome 153
+leaves `AXTitle` and `AXDescription` empty and moves the string to an `AXHeading`
+inside the sheet, so a title match found nothing while the prompt was on screen.
+An untitled dialog whose heading matches now counts as the host. The heading walk
+is capped at five levels and only runs for dialog-role children that are
+themselves untitled, so the idle scan still costs what 1.2.0 measured.
+
+### macOS: AXPress is acknowledged and Allow never runs
+
+`AXPress` returns `kAXErrorSuccess` on this button and the button does not fire -
+Chrome's accessibility shim answers the action without dispatching it. Worse, the
+re-press that 1.2.0 added to cover slow teardown *removes the sheet* on 153 while
+leaving the debug socket unapproved. Both AX references go invalid, which is
+exactly the signal used to mean "dismissed", so every one of those was logged
+`APPROVED` with nothing granted. Verified by holding a CDP websocket open across
+the approval: the log said approved, the socket never opened.
+
+So the re-press is gone, and the fallback is a keystroke instead. `AXFocused` is
+an attribute write rather than a command dispatch, and Chrome honours it, so
+focus moves onto Allow; `Space` then goes to Chrome's pid via
+`CGEventPostToPid`, which delivers keyboard events even though it silently drops
+mouse events. Nine of nine approvals landed on Chrome 153.0.8010.48, each
+verified by a websocket reaching `OPEN` rather than by the sheet vanishing, at
+about 1.0 s from prompt to approval. The pointer does not move and Chrome is
+never activated, so the 1.2.0 promises still hold. `pyobjc-framework-Quartz` is
+required again, for keyboard events only.
+
+A sheet that survives both is logged `FAILED` and retried next sweep, as before.
+There is still no synthetic mouse click anywhere in the engine.
+
+### macOS: the log says which decision was made
+
+Every approval path now leaves a trail: each dialog-role candidate with its
+label, heading and accept decision; the `AXPress` error code; and the liveness
+and visibility of both references after each attempt. The false approvals above
+were indistinguishable from real ones in the old log, which is why they survived
+two releases.
+
 ## 1.2.0
 
 The macOS engine, hardened against real load. Most of this began as a pull
