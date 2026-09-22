@@ -78,7 +78,14 @@ try:
         kAXValueCGSizeType,
     )
     from AppKit import NSRunningApplication, NSWorkspace
-    from Quartz import CGEventCreateKeyboardEvent, CGEventPostToPid
+    from Quartz import (
+        CGEventCreateKeyboardEvent,
+        CGEventPostToPid,
+        CGSessionCopyCurrentDictionary,
+        CGWindowListCopyWindowInfo,
+        kCGNullWindowID,
+        kCGWindowListOptionOnScreenOnly,
+    )
 except ImportError:
     sys.exit(
         "Yes, Dev macOS engine needs pyobjc:\n"
@@ -139,8 +146,48 @@ VK_SPACE = 0x31
 ACTIVATION_GUARD_S = 0.6
 # Tab stops to walk looking for Allow: three buttons plus slack.
 MAX_TAB_STOPS = 6
+# Chrome draws the consent sheet as its own window at this size. Used only
+# while the screen is locked, when the accessibility tree is unreadable.
+CONSENT_WINDOW_SIZE = (448, 240)
 
 
+def _screen_locked() -> bool:
+    """Whether this Mac's screen is locked.
+
+    A locked screen still draws Chrome's consent windows, but macOS refuses
+    accessibility reads of other apps, so the engine sees no dialog and the
+    prompts stack. The session dictionary is readable from our own process.
+
+    @returns True when CGSSessionScreenIsLocked is set.
+    """
+    session = CGSessionCopyCurrentDictionary()
+    if not session:
+        return False
+    return bool(session.get("CGSSessionScreenIsLocked"))
+
+
+def _consent_windows(pids: tuple[int, ...]) -> int:
+    """Count on-screen Chrome windows the size of the consent sheet.
+
+    Window-server geometry stays available while the screen is locked, which
+    is the one signal left once accessibility reads start failing.
+
+    @param pids - Chrome process ids to count windows for.
+    @returns How many of those windows are the consent sheet's size.
+    """
+    if not pids:
+        return 0
+    wanted = set(pids)
+    windows = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID) or []
+    waiting = 0
+    width, height = CONSENT_WINDOW_SIZE
+    for window in windows:
+        if window.get("kCGWindowOwnerPID") not in wanted:
+            continue
+        bounds = window.get("kCGWindowBounds") or {}
+        if int(bounds.get("Width", 0)) == width and int(bounds.get("Height", 0)) == height:
+            waiting += 1
+    return waiting
 
 
 def _attr(element, name):
@@ -267,6 +314,8 @@ class Engine:
         self._parent_pid = os.getppid()
         self._seen: dict[str, float] = {}    # dedupe key -> last-press wall clock
         self._next_diagnostic_at = 0.0
+        self._screen_was_locked = False
+        self._locked_dialogs = -1
 
     # -------- logging: byte-for-byte the format the tray parses --------
 
@@ -585,10 +634,40 @@ class Engine:
         }
         return " ".join(f"{key}={value!r}" for key, value in attributes.items())
 
+    def _skip_while_locked(self) -> bool:
+        """Skip the sweep while the screen is locked, and say why.
+
+        Logged on the transition into the lock, and again only when another
+        consent window appears, so a locked machine does not fill the log at
+        poll rate. The process stays up: KeepAlive would just restart it, and
+        the next sweep after unlock should clear whatever stacked.
+
+        @returns True when this sweep should do nothing else.
+        """
+        if not _screen_locked():
+            if self._screen_was_locked:
+                self.log("screen unlocked - scanning for consent dialogs again")
+                self._screen_was_locked = False
+                self._locked_dialogs = -1
+            return False
+        waiting = _consent_windows(tuple(self.chrome_pids()))
+        if not self._screen_was_locked or waiting != self._locked_dialogs:
+            self.log(
+                f"screen is locked - Accessibility cannot read other apps, so "
+                f"consent dialogs cannot be approved ({waiting} on screen). "
+                f"Unlock the screen to resume.",
+                "ERROR",
+            )
+            self._locked_dialogs = waiting
+        self._screen_was_locked = True
+        return True
+
     # -------- one sweep, and the loop --------
 
     def sweep(self) -> None:
         now = time.time()
+        if self._skip_while_locked():
+            return
         is_diagnostic_sweep = self.diagnostics and now >= self._next_diagnostic_at
         if is_diagnostic_sweep:
             self._next_diagnostic_at = now + 5

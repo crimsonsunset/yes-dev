@@ -3,6 +3,16 @@
 Newest first. Each entry says what changed and, where it matters, what was
 measured - the numbers are from this repo's own runs, not estimates.
 
+## 1.2.2
+
+### macOS: a locked screen is reported instead of looking idle
+
+macOS still draws the consent windows on a locked screen and refuses
+accessibility reads of other apps, so the engine saw nothing and the prompts
+stacked. A locked screen now logs one ERROR naming how many consent-sized
+windows are waiting, logs again only when that count changes, and resumes on
+the first sweep after unlock. The process stays up.
+
 ## 1.2.1
 
 macOS on Chrome 153. The engine found the sheet, logged an approval, and Chrome
